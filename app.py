@@ -201,7 +201,7 @@ Start immediately with the answer."""
                 ],
                 max_tokens=1000,
                 temperature=0.3,
-                timeout=60
+                timeout=120
             )
             raw = response.choices[0].message.content.strip()
             return clean_answer(raw)
