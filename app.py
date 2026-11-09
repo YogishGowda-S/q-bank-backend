@@ -550,4 +550,10 @@ def download(subject_id):
     buf = io.BytesIO()
     build_pdf(subject["name"], rows, buf)
     buf.seek(0)
-    filename = re.sub(r"[^\w\-]+", "_", subject["name"]
+    filename = re.sub(r"[^\w\-]+", "_", subject["name"]).strip("_") or "answers"
+    return send_file(buf, mimetype="application/pdf", as_attachment=True,
+                     download_name=f"{filename}_answers.pdf")
+
+
+if __name__ == "__main__":
+    app.run(debug=True)
