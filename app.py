@@ -545,4 +545,3 @@ def generate(question_id):
 
     answer = clean_answer(raw)
     if not answer:
-        return jsonify(error="The model returned an empty answer.Please retry."),502
