@@ -1,6 +1,7 @@
 import io
 import os
 import re
+import time
 import html
 import hashlib
 import traceback
@@ -32,8 +33,9 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 groq_client = Groq(api_key=GROQ_API_KEY, timeout=60, max_retries=1) if GROQ_API_KEY else None
 
 MAX_QUESTIONS = 80
-MAX_PDF_PAGES = 80
-MAX_NOTE_CHARS_PER_FILE = 200000
+MAX_PDF_PAGES = 60
+MAX_NOTE_CHARS_PER_FILE = 300000
+EXTRACT_TIME_BUDGET = 60  # seconds; server-side PDF reading is only a fallback
 
 
 # ───────────────────────── database helpers ─────────────────────────
@@ -181,10 +183,15 @@ def parse_questions(streams, default_marks):
 
 
 def extract_pdf_text(stream):
+    """Fallback only: the web page normally extracts PDF text in the browser.
+    Stops at the time budget so a big PDF can never run into the gunicorn timeout."""
     parts, total = [], 0
+    deadline = time.monotonic() + EXTRACT_TIME_BUDGET
+    truncated = False
     with pdfplumber.open(stream) as pdf:
         for i, page in enumerate(pdf.pages):
-            if i >= MAX_PDF_PAGES or total >= MAX_NOTE_CHARS_PER_FILE:
+            if i >= MAX_PDF_PAGES or total >= MAX_NOTE_CHARS_PER_FILE or time.monotonic() > deadline:
+                truncated = True
                 break
             text = page.extract_text() or ""
             if text.strip():
@@ -192,7 +199,7 @@ def extract_pdf_text(stream):
                 total += len(text)
             if hasattr(page, "flush_cache"):
                 page.flush_cache()
-    return "\n\n".join(parts)[:MAX_NOTE_CHARS_PER_FILE]
+    return "\n\n".join(parts)[:MAX_NOTE_CHARS_PER_FILE], truncated
 
 
 def chunk_text(text, size=1200):
@@ -476,18 +483,8 @@ def upload_questions(subject_id):
     return jsonify(count=len(saved), questions=saved)
 
 
-@app.route("/api/subjects/<int:subject_id>/notes", methods=["POST"])
-def upload_notes(subject_id):
-    f = request.files.get("notes")
-    if not f or not f.filename:
-        return jsonify(error="Please choose a PDF"), 400
-    reset = request.form.get("reset") == "true"
-    try:
-        text = extract_pdf_text(io.BytesIO(f.read()))
-    except Exception as e:
-        return jsonify(error=f"Could not read {f.filename}: {str(e)[:150]}"), 400
-    chunks = chunk_text(text)
-
+def save_note_chunks(subject_id, source, text, reset):
+    chunks = chunk_text(text) if text.strip() else []
     conn = get_conn()
     try:
         with conn.cursor() as cur:
@@ -496,11 +493,36 @@ def upload_notes(subject_id):
             if chunks:
                 execute_values(cur,
                                "INSERT INTO note_chunks (subject_id, source_file, chunk_text) VALUES %s",
-                               [(subject_id, f.filename[:200], c) for c in chunks])
+                               [(subject_id, source[:200], c) for c in chunks])
         conn.commit()
     finally:
         conn.close()
-    return jsonify(chunks=len(chunks), chars=len(text))
+    return len(chunks)
+
+
+@app.route("/api/subjects/<int:subject_id>/notes_text", methods=["POST"])
+def upload_notes_text(subject_id):
+    """Main path: the browser reads the PDF and sends only the text (fast, no server CPU)."""
+    data = request.get_json(silent=True) or {}
+    text = (data.get("text") or "")[:MAX_NOTE_CHARS_PER_FILE]
+    source = (data.get("source") or "notes")
+    chunks = save_note_chunks(subject_id, source, text, bool(data.get("reset")))
+    return jsonify(chunks=chunks, chars=len(text))
+
+
+@app.route("/api/subjects/<int:subject_id>/notes", methods=["POST"])
+def upload_notes(subject_id):
+    """Fallback path if the browser could not load the PDF reader: server reads the PDF."""
+    f = request.files.get("notes")
+    if not f or not f.filename:
+        return jsonify(error="Please choose a PDF"), 400
+    reset = request.form.get("reset") == "true"
+    try:
+        text, truncated = extract_pdf_text(io.BytesIO(f.read()))
+    except Exception as e:
+        return jsonify(error=f"Could not read {f.filename}: {str(e)[:150]}"), 400
+    chunks = save_note_chunks(subject_id, f.filename, text, reset)
+    return jsonify(chunks=chunks, chars=len(text), truncated=truncated)
 
 
 @app.route("/api/questions/<int:question_id>/generate", methods=["POST"])
@@ -523,37 +545,3 @@ def generate(question_id):
 
     answer = clean_answer(raw)
     if not answer:
-        return jsonify(error="The model returned an empty answer. Please retry."), 502
-
-    conn = get_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM answers WHERE question_id=%s", (question_id,))
-            cur.execute("INSERT INTO answers (question_id, answer_text, word_count) VALUES (%s, %s, %s)",
-                        (question_id, answer, len(answer.split())))
-        conn.commit()
-    finally:
-        conn.close()
-    return jsonify(answer=answer)
-
-
-@app.route("/api/download/<int:subject_id>", methods=["GET"])
-def download(subject_id):
-    subject = fetch_one("SELECT name FROM subjects WHERE id=%s", (subject_id,))
-    if not subject:
-        return jsonify(error="Subject not found"), 404
-    rows = fetch_all("""SELECT q.question_text, q.marks, a.answer_text
-                        FROM questions q LEFT JOIN answers a ON a.question_id = q.id
-                        WHERE q.subject_id=%s ORDER BY q.id""", (subject_id,))
-    if not rows:
-        return jsonify(error="No questions yet"), 404
-    buf = io.BytesIO()
-    build_pdf(subject["name"], rows, buf)
-    buf.seek(0)
-    filename = re.sub(r"[^\w\-]+", "_", subject["name"]).strip("_") or "answers"
-    return send_file(buf, mimetype="application/pdf", as_attachment=True,
-                     download_name=f"{filename}_answers.pdf")
-
-
-if __name__ == "__main__":
-    app.run(debug=True)
