@@ -545,3 +545,37 @@ def generate(question_id):
 
     answer = clean_answer(raw)
     if not answer:
+        return jsonify(error="The model returned an empty answer. Please retry."), 502
+
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM answers WHERE question_id=%s", (question_id,))
+            cur.execute("INSERT INTO answers (question_id, answer_text, word_count) VALUES (%s, %s, %s)",
+                        (question_id, answer, len(answer.split())))
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify(answer=answer)
+
+
+@app.route("/api/download/<int:subject_id>", methods=["GET"])
+def download(subject_id):
+    subject = fetch_one("SELECT name FROM subjects WHERE id=%s", (subject_id,))
+    if not subject:
+        return jsonify(error="Subject not found"), 404
+    rows = fetch_all("""SELECT q.question_text, q.marks, a.answer_text
+                        FROM questions q LEFT JOIN answers a ON a.question_id = q.id
+                        WHERE q.subject_id=%s ORDER BY q.id""", (subject_id,))
+    if not rows:
+        return jsonify(error="No questions yet"), 404
+    buf = io.BytesIO()
+    build_pdf(subject["name"], rows, buf)
+    buf.seek(0)
+    filename = re.sub(r"[^\w\-]+", "_", subject["name"]).strip("_") or "answers"
+    return send_file(buf, mimetype="application/pdf", as_attachment=True,
+                     download_name=f"{filename}_answers.pdf")
+
+
+if __name__ == "__main__":
+    app.run(debug=True)
